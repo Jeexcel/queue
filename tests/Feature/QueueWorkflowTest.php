@@ -4,7 +4,6 @@ namespace Tests\Feature;
 
 use App\Models\Announcement;
 use App\Models\QueueSession;
-use App\Models\QueueSetting;
 use App\Models\ServiceDesk;
 use App\Models\Ticket;
 use App\Models\TicketEvent;
@@ -12,6 +11,7 @@ use App\Models\User;
 use App\Services\QueueService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Str;
+use Illuminate\Validation\ValidationException;
 use Tests\TestCase;
 
 class QueueWorkflowTest extends TestCase
@@ -25,7 +25,12 @@ class QueueWorkflowTest extends TestCase
         $key = (string) Str::uuid();
 
         $response = $this->post('/tickets', ['request_key' => $key]);
-        $response->assertOk()->assertSee('A001')->assertSee('Please wait for your number');
+        $response->assertOk()
+            ->assertSee('A001')
+            ->assertSee('Please wait for your number')
+            ->assertSee('You’ll return to ticket collection after printing.')
+            ->assertSee('afterprint')
+            ->assertSee(route('home'));
         $this->post('/tickets', ['request_key' => $key])->assertOk()->assertSee('A001');
         $this->post('/tickets', ['request_key' => (string) Str::uuid()])->assertOk()->assertSee('A002');
 
@@ -153,10 +158,47 @@ class QueueWorkflowTest extends TestCase
         $this->assertSame('admin', $admin->fresh()->role);
 
         $this->actingAs($staff)->get('/admin')->assertForbidden();
+        foreach ([
+            'admin.sessions',
+            'admin.monitor',
+            'admin.desks.index',
+            'admin.staff.index',
+            'admin.history',
+            'admin.settings.page',
+            'admin.sms.index',
+            'admin.audit',
+        ] as $route) {
+            $this->get(route($route))->assertForbidden();
+        }
         $this->actingAs($admin)->get('/staff')->assertForbidden();
         $staffResponse = $this->actingAs($staff)->get('/staff');
         $staffResponse->assertOk();
         $this->actingAs($admin)->get('/admin')->assertOk();
+    }
+
+    public function test_admin_sections_render_as_separate_pages_with_a_shared_sidebar(): void
+    {
+        $this->actingAs(User::factory()->create(['role' => 'admin']));
+
+        foreach ([
+            'admin.index' => 'Queue overview',
+            'admin.sessions' => 'Queue sessions',
+            'admin.monitor' => 'Queue monitor',
+            'admin.desks.index' => 'Service desks',
+            'admin.staff.index' => 'Staff accounts',
+            'admin.history' => 'Ticket history',
+            'admin.settings.page' => 'Queue settings',
+            'admin.sms.index' => 'SMS settings',
+            'admin.audit' => 'Audit log',
+        ] as $route => $heading) {
+            $this->get(route($route))
+                ->assertOk()
+                ->assertSee($heading)
+                ->assertSee('Admin pages')
+                ->assertSee('aria-current="page"', false);
+        }
+
+        $this->get(route('admin.index'))->assertDontSee('Desk availability');
     }
 
     public function test_session_end_preserves_active_ticket_and_prevents_new_claims(): void
@@ -186,7 +228,7 @@ class QueueWorkflowTest extends TestCase
             'password' => 'a-strong-staff-password',
             'password_confirmation' => 'a-strong-staff-password',
             'service_desk_id' => $deskOne->id,
-        ])->assertRedirect(route('admin.index'));
+        ])->assertRedirect(route('admin.staff.index'));
 
         $staff = User::query()->where('email', 'queue-staff@example.test')->firstOrFail();
         $this->put("/admin/staff/{$staff->id}", [
@@ -195,7 +237,7 @@ class QueueWorkflowTest extends TestCase
             'phone' => '+233200000011',
             'service_desk_id' => $deskTwo->id,
             'is_active' => '1',
-        ])->assertRedirect(route('admin.index'));
+        ])->assertRedirect(route('admin.staff.index'));
         $this->assertSame('Updated Queue Staff', $staff->fresh()->name);
         $this->assertSame($deskTwo->id, $staff->fresh()->service_desk_id);
 
@@ -215,11 +257,11 @@ class QueueWorkflowTest extends TestCase
         $admin = User::factory()->create(['role' => 'admin']);
         app(QueueService::class)->startSession($admin, 'First');
 
-        $this->expectException(\Illuminate\Validation\ValidationException::class);
+        $this->expectException(ValidationException::class);
         app(QueueService::class)->startSession($admin, 'Second');
     }
 
-    private function openSession(): \App\Models\QueueSession
+    private function openSession(): QueueSession
     {
         $admin = User::factory()->create(['role' => 'admin']);
 

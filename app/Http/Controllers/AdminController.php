@@ -11,45 +11,51 @@ use App\Models\TicketEvent;
 use App\Models\User;
 use App\Services\QueueService;
 use App\Services\Sms\SmsProviderManager;
-use Illuminate\Http\RedirectResponse;
-use Illuminate\Http\Request;
-use Illuminate\Support\Facades\DB;
-use Illuminate\Validation\Rule;
-use Illuminate\View\View;
+use Illuminate\Contracts\Pagination\LengthAwarePaginator;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\RequestException;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Validation\Rule;
+use Illuminate\View\View;
 
 class AdminController extends Controller
 {
-    public function index(): View
+    public function index(Request $request): View
     {
-        $sessionId = DB::table('queue_control')->where('id', 1)->value('active_session_id');
-        $session = $sessionId ? QueueSession::query()->find($sessionId) : null;
-        $desks = ServiceDesk::query()->with(['staff' => fn ($query) => $query->where('is_active', true)])->orderBy('id')->get();
-        $staff = User::query()->where('role', 'staff')->with('serviceDesk')->orderBy('name')->get();
-        $tickets = Ticket::query()->with(['staff', 'serviceDesk', 'queueSession'])->latest('id')->paginate(40);
-        $ticketEvents = TicketEvent::query()->with(['ticket.queueSession', 'staff', 'serviceDesk'])->latest('id')->limit(30)->get();
-        $sessions = QueueSession::query()->withCount('tickets')->latest('id')->limit(10)->get();
-        $audits = DB::table('audit_logs')->leftJoin('users', 'users.id', '=', 'audit_logs.user_id')
-            ->select('audit_logs.*', 'users.name as user_name')->latest('audit_logs.id')->limit(12)->get();
-        $settings = QueueSetting::query()->firstOrFail();
-        $sms = SmsSetting::query()->firstOrFail();
-        $activeStatusByDesk = Ticket::query()->whereIn('status', ['called', 'serving'])->get(['service_desk_id', 'status'])->keyBy('service_desk_id');
+        $section = $request->route('section', 'overview');
+        $data = match ($section) {
+            'overview' => $this->overviewData(),
+            'sessions' => $this->sessionData(),
+            'desks' => $this->deskData(),
+            'staff' => $this->staffData(),
+            'settings' => ['settings' => QueueSetting::query()->firstOrFail()],
+            'sms' => ['sms' => SmsSetting::query()->firstOrFail()],
+            'monitor' => ['tickets' => $this->tickets(['waiting', 'called', 'serving', 'skipped'])],
+            'history' => $this->historyData(),
+            'audit' => ['audits' => $this->auditEntries()],
+            default => abort(404),
+        };
 
-        return view('admin', compact('session', 'desks', 'staff', 'tickets', 'sessions', 'audits', 'settings', 'sms', 'activeStatusByDesk', 'ticketEvents'));
+        return view('admin', ['section' => $section] + $data);
     }
 
     public function startSession(Request $request, QueueService $queue): RedirectResponse
     {
         $data = $request->validate(['label' => ['required', 'string', 'max:120']]);
         $queue->startSession($request->user(), $data['label']);
-        return redirect()->route('admin.index')->with('status', 'Queue session started.');
+
+        return redirect()->route('admin.sessions')->with('status', 'Queue session started.');
     }
 
     public function endSession(Request $request, QueueService $queue): RedirectResponse
     {
         $queue->endSession($request->user());
-        return redirect()->route('admin.index')->with('status', 'Session ended. Existing tickets and assignments remain in history.');
+
+        return redirect()->route('admin.sessions')->with('status', 'Session ended. Existing tickets and assignments remain in history.');
     }
 
     public function createDesk(Request $request): RedirectResponse
@@ -57,7 +63,8 @@ class AdminController extends Controller
         $data = $request->validate(['name' => ['required', 'string', 'max:100'], 'code' => ['nullable', 'string', 'max:32', 'unique:service_desks,code']]);
         $desk = ServiceDesk::query()->create($data + ['is_active' => true]);
         $this->audit($request, 'desk.created', ['desk_id' => $desk->id]);
-        return redirect()->route('admin.index')->with('status', 'Service desk created.');
+
+        return redirect()->route('admin.desks.index')->with('status', 'Service desk created.');
     }
 
     public function updateDesk(Request $request, ServiceDesk $desk): RedirectResponse
@@ -72,7 +79,8 @@ class AdminController extends Controller
         }
         $desk->update($data);
         $this->audit($request, 'desk.updated', ['desk_id' => $desk->id, 'is_active' => $desk->is_active]);
-        return redirect()->route('admin.index')->with('status', 'Service desk updated.');
+
+        return redirect()->route('admin.desks.index')->with('status', 'Service desk updated.');
     }
 
     public function createStaff(Request $request): RedirectResponse
@@ -102,7 +110,8 @@ class AdminController extends Controller
             ]);
             $this->audit($request, 'staff.created', ['staff_id' => $user->id, 'service_desk_id' => $deskId]);
         }, 3);
-        return redirect()->route('admin.index')->with('status', 'Staff account created.');
+
+        return redirect()->route('admin.staff.index')->with('status', 'Staff account created.');
     }
 
     public function updateStaff(Request $request, User $staff): RedirectResponse
@@ -137,7 +146,8 @@ class AdminController extends Controller
             ]);
             $this->audit($request, 'staff.updated', ['staff_id' => $staff->id, 'service_desk_id' => $deskId, 'is_active' => (bool) $data['is_active']]);
         }, 3);
-        return redirect()->route('admin.index')->with('status', 'Staff assignment updated.');
+
+        return redirect()->route('admin.staff.index')->with('status', 'Staff assignment updated.');
     }
 
     public function updateSettings(Request $request): RedirectResponse
@@ -152,7 +162,8 @@ class AdminController extends Controller
         ]);
         QueueSetting::query()->firstOrFail()->update($data);
         $this->audit($request, 'queue.settings_updated', ['ticket_prefix' => $data['ticket_prefix'], 'skip_policy' => $data['skip_policy']]);
-        return redirect()->route('admin.index')->with('status', 'Queue settings saved. The prefix applies to new sessions.');
+
+        return redirect()->route('admin.settings.page')->with('status', 'Queue settings saved. The prefix applies to new sessions.');
     }
 
     public function updateSmsSettings(Request $request): RedirectResponse
@@ -178,7 +189,8 @@ class AdminController extends Controller
             'credentials' => $credentials,
         ]);
         $this->audit($request, 'sms.settings_updated', ['provider' => $setting->provider]);
-        return redirect()->route('admin.index')->with('status', 'SMS settings saved. Secret fields are encrypted and omitted from responses.');
+
+        return redirect()->route('admin.sms.index')->with('status', 'SMS settings saved. Secret fields are encrypted and omitted from responses.');
     }
 
     public function testSms(Request $request, SmsProviderManager $providers): RedirectResponse
@@ -187,24 +199,109 @@ class AdminController extends Controller
         try {
             $providers->send($data['phone'], 'Queue Management SMS test.');
         } catch (ConnectionException|RequestException|\RuntimeException $exception) {
-            \Illuminate\Support\Facades\Log::warning('SMS test delivery failed.', ['provider_error' => class_basename($exception)]);
+            Log::warning('SMS test delivery failed.', ['provider_error' => class_basename($exception)]);
+
             return back()->withErrors(['sms' => 'The provider could not deliver the test message. Check the provider settings and try again.']);
         }
         $this->audit($request, 'sms.test_sent', ['phone_suffix' => substr($data['phone'], -4)]);
-        return redirect()->route('admin.index')->with('status', 'Test message sent.');
+
+        return redirect()->route('admin.sms.index')->with('status', 'Test message sent.');
     }
 
     public function recoverTicket(Request $request, Ticket $ticket, QueueService $queue): RedirectResponse
     {
         $data = $request->validate(['reason' => ['required', 'string', 'max:500']]);
         $queue->recover($ticket, $request->user(), $data['reason']);
-        return redirect()->route('admin.index')->with('status', "{$ticket->ticket_number} was recovered and returned to the waiting queue.");
+
+        return redirect()->route('admin.monitor')->with('status', "{$ticket->ticket_number} was recovered and returned to the waiting queue.");
     }
 
     public function recallSkippedTicket(Request $request, Ticket $ticket, QueueService $queue): RedirectResponse
     {
         $queue->recallSkipped($ticket, $request->user());
-        return redirect()->route('admin.index')->with('status', "{$ticket->ticket_number} was returned to the waiting queue.");
+
+        return redirect()->route('admin.monitor')->with('status', "{$ticket->ticket_number} was returned to the waiting queue.");
+    }
+
+    private function overviewData(): array
+    {
+        $session = $this->activeSession();
+
+        return [
+            'session' => $session,
+            'activeDeskCount' => ServiceDesk::query()->where('is_active', true)->count(),
+            'activeStaffCount' => User::query()->where('role', 'staff')->where('is_active', true)->count(),
+            'waitingCount' => $session?->tickets()->where('status', 'waiting')->count() ?? 0,
+        ];
+    }
+
+    private function sessionData(): array
+    {
+        return [
+            'session' => $this->activeSession(),
+            'sessions' => QueueSession::query()->withCount('tickets')->latest('id')->limit(10)->get(),
+        ];
+    }
+
+    private function activeSession(): ?QueueSession
+    {
+        $sessionId = DB::table('queue_control')->where('id', 1)->value('active_session_id');
+
+        return $sessionId ? QueueSession::query()->find($sessionId) : null;
+    }
+
+    private function deskData(): array
+    {
+        return [
+            'desks' => ServiceDesk::query()
+                ->with(['staff' => fn ($query) => $query->where('is_active', true)])
+                ->orderBy('id')
+                ->get(),
+            'activeStatusByDesk' => Ticket::query()
+                ->whereIn('status', ['called', 'serving'])
+                ->get(['service_desk_id', 'status'])
+                ->keyBy('service_desk_id'),
+        ];
+    }
+
+    private function staffData(): array
+    {
+        return [
+            'desks' => ServiceDesk::query()->orderBy('id')->get(),
+            'activeDesks' => ServiceDesk::query()->where('is_active', true)->orderBy('id')->get(),
+            'staff' => User::query()->where('role', 'staff')->with('serviceDesk')->orderBy('name')->get(),
+        ];
+    }
+
+    private function historyData(): array
+    {
+        return [
+            'tickets' => $this->tickets(),
+            'ticketEvents' => TicketEvent::query()
+                ->with(['ticket.queueSession', 'staff', 'serviceDesk'])
+                ->latest('id')
+                ->limit(30)
+                ->get(),
+        ];
+    }
+
+    private function tickets(array $statuses = []): LengthAwarePaginator
+    {
+        return Ticket::query()
+            ->with(['staff', 'serviceDesk', 'queueSession'])
+            ->when($statuses, fn ($query) => $query->whereIn('status', $statuses))
+            ->latest('id')
+            ->paginate(40);
+    }
+
+    private function auditEntries(): Collection
+    {
+        return DB::table('audit_logs')
+            ->leftJoin('users', 'users.id', '=', 'audit_logs.user_id')
+            ->select('audit_logs.*', 'users.name as user_name')
+            ->latest('audit_logs.id')
+            ->limit(40)
+            ->get();
     }
 
     private function assertDeskAvailable(int $deskId, ?int $ignoreStaffId = null): void

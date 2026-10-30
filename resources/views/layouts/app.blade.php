@@ -35,7 +35,7 @@
             @foreach($errors->all() as $error)<div class="flash error">{{ $error }}</div>@endforeach
         </section>
     @endif
-    <main>@yield('content')</main>
+    <main class="@yield('main-class')">@yield('content')</main>
     @stack('scripts')
 </body>
 </html>

@@ -39,6 +39,14 @@ Route::middleware(['auth', 'role:staff'])->prefix('staff')->name('staff')->group
 
 Route::middleware(['auth', 'role:admin'])->prefix('admin')->name('admin')->group(function () {
     Route::get('/', [AdminController::class, 'index'])->name('.index');
+    Route::get('/sessions', [AdminController::class, 'index'])->defaults('section', 'sessions')->name('.sessions');
+    Route::get('/desks', [AdminController::class, 'index'])->defaults('section', 'desks')->name('.desks.index');
+    Route::get('/staff', [AdminController::class, 'index'])->defaults('section', 'staff')->name('.staff.index');
+    Route::get('/settings', [AdminController::class, 'index'])->defaults('section', 'settings')->name('.settings.page');
+    Route::get('/sms', [AdminController::class, 'index'])->defaults('section', 'sms')->name('.sms.index');
+    Route::get('/monitor', [AdminController::class, 'index'])->defaults('section', 'monitor')->name('.monitor');
+    Route::get('/history', [AdminController::class, 'index'])->defaults('section', 'history')->name('.history');
+    Route::get('/audit', [AdminController::class, 'index'])->defaults('section', 'audit')->name('.audit');
     Route::post('/sessions/start', [AdminController::class, 'startSession'])->name('.session.start');
     Route::post('/sessions/end', [AdminController::class, 'endSession'])->name('.session.end');
     Route::post('/desks', [AdminController::class, 'createDesk'])->name('.desks.create');

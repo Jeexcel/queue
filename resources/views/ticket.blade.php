@@ -13,9 +13,16 @@
         <div class="ticket-divider"></div>
         <p>Please wait for your number to appear on the waiting-room display.</p>
         <small>Session: {{ $ticket->queueSession->label }}</small>
+        <small class="no-print">You’ll return to ticket collection after printing.</small>
     </article>
 </section>
 @push('scripts')
-<script>window.addEventListener('load', () => window.setTimeout(() => window.print(), 350));</script>
+<script>
+    window.addEventListener('afterprint', () => {
+        window.location.assign(@json(route('home')));
+    }, { once: true });
+
+    window.addEventListener('load', () => window.setTimeout(() => window.print(), 350));
+</script>
 @endpush
 @endsection
